@@ -1,0 +1,230 @@
+import cv2
+import numpy as np
+
+# ============================================================
+#   STRUKTURY DANYCH I²D
+# ============================================================
+
+class Frame:
+    def __init__(self, frame_id, time, raw):
+        self.id = frame_id
+        self.time = time
+        self.raw = raw
+        self.L = None
+        self.C = None
+        self.M = None
+        self.F = None
+
+class Detection:
+    def __init__(self, frame_id, time, x, y, dtype, strength, layer, desc):
+        self.frame_id = frame_id
+        self.time = time
+        self.x = x
+        self.y = y
+        self.dtype = dtype
+        self.strength = strength
+        self.layer = layer
+        self.desc = desc
+
+# ============================================================
+#   FRAME LOADER
+# ============================================================
+
+def load_video(path):
+    cap = cv2.VideoCapture(path)
+    frames = []
+    frame_id = 0
+
+    while True:
+        ret, raw = cap.read()
+        if not ret:
+            break
+
+        time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+        frames.append(Frame(frame_id, time, raw))
+        frame_id += 1
+
+    cap.release()
+    return frames
+
+# ============================================================
+#   LAYER SPLITTER
+# ============================================================
+
+def split_layers(frames):
+    prev_L = None
+
+    for f in frames:
+        # Jasność
+        f.L = cv2.cvtColor(f.raw, cv2.COLOR_BGR2GRAY)
+
+        # Kolor HSV
+        f.C = cv2.cvtColor(f.raw, cv2.COLOR_BGR2HSV)
+
+        # Ruch (różnica klatek)
+        if prev_L is None:
+            f.M = np.zeros_like(f.L)
+        else:
+            f.M = cv2.absdiff(f.L, prev_L)
+
+        prev_L = f.L
+
+        # Widmo (FFT)
+        F = np.fft.fft2(f.L)
+        f.F = np.fft.fftshift(F)
+
+# ============================================================
+#   TWIST DETECTOR (skręt)
+# ============================================================
+
+def detect_twist(frames, block=16, thr=20):
+    detections = []
+
+    for f in frames:
+        L = f.L
+        h, w = L.shape
+
+        for y in range(0, h, block):
+            for x in range(0, w, block):
+                region = L[y:y+block, x:x+block]
+                if region.size == 0:
+                    continue
+
+                left = np.mean(region[:, :block//2])
+                right = np.mean(region[:, block//2:])
+                top = np.mean(region[:block//2, :])
+                bottom = np.mean(region[block//2:, :])
+
+                T = abs(left - right) + abs(top - bottom)
+
+                if T > thr:
+                    detections.append(
+                        Detection(f.id, f.time, x, y, "twist", T, "L",
+                                  "lokalna asymetria (skręt)")
+                    )
+
+    return detections
+
+# ============================================================
+#   DEFECT SCANNER v2 (ρ)
+# ============================================================
+
+def detect_defects_v2(frames,
+                      block_size=16,
+                      thr_motion=25.0,
+                      thr_light=30.0,
+                      thr_color=30.0):
+    detections = []
+
+    prev_L = None
+    prev_V = None
+
+    for f in frames:
+        L = f.L
+        C = f.C
+        M = f.M
+
+        h, w = L.shape
+        V = C[:, :, 2]  # jasność HSV
+
+        dL = cv2.absdiff(L, prev_L) if prev_L is not None else None
+        dV = cv2.absdiff(V, prev_V) if prev_V is not None else None
+
+        for y in range(0, h, block_size):
+            for x in range(0, w, block_size):
+
+                # RUCH
+                region_M = M[y:y+block_size, x:x+block_size]
+                motion_strength = float(np.mean(region_M))
+
+                if motion_strength > thr_motion:
+                    detections.append(
+                        Detection(
+                            f.id, f.time, x, y,
+                            "defect_motion",
+                            motion_strength,
+                            "M",
+                            "nagła zmiana ruchu (defekt / przełączenie warstwy)"
+                        )
+                    )
+
+                # JASNOŚĆ L
+                if dL is not None:
+                    region_dL = dL[y:y+block_size, x:x+block_size]
+                    light_strength = float(np.mean(region_dL))
+
+                    if light_strength > thr_light:
+                        detections.append(
+                            Detection(
+                                f.id, f.time, x, y,
+                                "defect_light",
+                                light_strength,
+                                "L",
+                                "nagły skok jasności (defekt / przełączenie warstwy)"
+                            )
+                        )
+
+                # JASNOŚĆ V (HSV)
+                if dV is not None:
+                    region_dV = dV[y:y+block_size, x:x+block_size]
+                    color_light_strength = float(np.mean(region_dV))
+
+                    if color_light_strength > thr_color:
+                        detections.append(
+                            Detection(
+                                f.id, f.time, x, y,
+                                "defect_color_light",
+                                color_light_strength,
+                                "C",
+                                "nagły skok jasności HSV (defekt / nakładka)"
+                            )
+                        )
+
+        prev_L = L
+        prev_V = V
+
+    return detections
+
+# ============================================================
+#   SPECTRAL OVERLAY DETECTOR
+# ============================================================
+
+def detect_spectral(frames, block=32, multiplier=3.0):
+    detections = []
+
+    for f in frames:
+        F = np.abs(f.F)
+        h, w = F.shape
+        global_mean = np.mean(F)
+
+        for y in range(0, h, block):
+            for x in range(0, w, block):
+                region = F[y:y+block, x:x+block]
+                strength = float(np.mean(region))
+
+                if strength > global_mean * multiplier:
+                    detections.append(
+                        Detection(
+                            f.id, f.time, x, y,
+                            "spectral",
+                            strength,
+                            "F",
+                            "anomalia widmowa / modulacja"
+                        )
+                    )
+
+    return detections
+
+# ============================================================
+#   PIPELINE I²D
+# ============================================================
+
+def run_i2d(path):
+    frames = load_video(path)
+    split_layers(frames)
+
+    twist = detect_twist(frames)
+    defects = detect_defects_v2(frames)
+    spectral = detect_spectral(frames)
+
+    return twist + defects + spectral
