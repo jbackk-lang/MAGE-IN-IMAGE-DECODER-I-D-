@@ -1,3 +1,7 @@
+## Dokumentacja online
+https://jbackk-lang.github.io/# SYNOPTYK  
+TIMDR + Λ–τ–ρ na danych synoptycznych IMGW
+
 # MAGE-IN-IMAGE-DECODER-I-D-
 Dekoder obrazu w obrazie i innych rzeczy czytaj opis
 
